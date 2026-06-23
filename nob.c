@@ -13,9 +13,12 @@ int main(int argc, char **argv)
     Nob_Cmd cmd = {0};
     nob_cmd_append(&cmd, "cc", "-Wall", "-Wextra", "-O2", "-g");
     nob_cmd_append(&cmd, "-I/usr/include/gdal");
+    nob_cmd_append(&cmd, "-Ivendor/onnxruntime/include");
     nob_cmd_append(&cmd, "-o", BUILD_FOLDER"swath");
     nob_cmd_append(&cmd, "src/main.c");
     nob_cmd_append(&cmd, "-lproj", "-lgdal", "-lm");
+    nob_cmd_append(&cmd, "-Lvendor/onnxruntime/lib", "-lonnxruntime");
+    nob_cmd_append(&cmd, "-Wl,-rpath,$ORIGIN/../vendor/onnxruntime/lib");
 
     if (!nob_cmd_run_sync(cmd)) return 1;
 

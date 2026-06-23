@@ -3,3 +3,6 @@ nob.old
 build/
 *.o
 /output/
+/vendor/
+/.venv/
+*.onnx
