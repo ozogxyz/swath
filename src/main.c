@@ -285,6 +285,102 @@ static int cmd_infer(int argc, char **argv)
     return ok ? 0 : 1;
 }
 
+static int cmd_segment(int argc, char **argv)
+{
+    if (argc != 3) {
+	fprintf(stderr, "usage: swath segment <in.tif> <out.tif> <model.onnx>\n");
+	return 1;
+    }
+    const char *in_path    = argv[0];
+    const char *out_path   = argv[1];
+    const char *model_path = argv[2];
+
+    GDALAllRegister();
+
+    /* --- read band -> float buffer (1-band row-major already == NCHW) --- */
+    GDALDatasetH in = GDALOpen(in_path, GA_ReadOnly);
+    if (!in) { fprintf(stderr, "open failed: %s\n", in_path); return 1; }
+    int nx = GDALGetRasterXSize(in);
+    int ny = GDALGetRasterYSize(in);
+    GDALRasterBandH iband = GDALGetRasterBand(in, 1);
+    int has_nodata = 0;
+    double nodata = GDALGetRasterNoDataValue(iband, &has_nodata);
+
+    size_t n = (size_t)nx * ny;
+    float *buf = malloc(n * sizeof(float));
+    if (!buf) { fprintf(stderr, "oom\n"); return 1; }
+    if (GDALRasterIO(iband, GF_Read, 0, 0, nx, ny, buf, nx, ny, GDT_Float32, 0, 0) != CE_None) {
+	fprintf(stderr, "read failed\n"); return 1;
+    }
+
+    /* --- forward pass: input 1 x 1 x ny x nx (H=ny, W=nx) --- */
+    const OrtApi *g = OrtGetApiBase()->GetApi(ORT_API_VERSION);
+    if (!g) { fprintf(stderr, "onnx: api version mismatch\n"); return 1; }
+
+    OrtEnv *env = NULL;
+    ORT_CHECK(g, g->CreateEnv(ORT_LOGGING_LEVEL_WARNING, "swath", &env));
+    OrtSessionOptions *opts = NULL;
+    ORT_CHECK(g, g->CreateSessionOptions(&opts));
+    OrtSession *session = NULL;
+    ORT_CHECK(g, g->CreateSession(env, model_path, opts, &session));
+    OrtMemoryInfo *mem = NULL;
+    ORT_CHECK(g, g->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &mem));
+
+    int64_t shape[4] = {1, 1, ny, nx}; /* must match the model's */
+    OrtValue *input_tensor = NULL;
+    ORT_CHECK(g, g->CreateTensorWithDataAsOrtValue(
+    mem, buf, n * sizeof(float), shape, 4,
+    ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &input_tensor));
+
+    const char *input_names[]  = { "input" };
+    const char *output_names[] = { "output" };
+    OrtValue *output_tensor = NULL;
+    ORT_CHECK(g, g->Run(session, NULL,
+    input_names, (const OrtValue *const *)&input_tensor, 1,
+    output_names, 1, &output_tensor));
+
+    float *out = NULL;
+    ORT_CHECK(g, g->GetTensorMutableData(output_tensor, (void **)&out));
+
+    /* --- scores -> Byte mask; nodata stays background (model has no nodata concept) --- */
+    unsigned char *mask = malloc(n);
+    if (!mask) { fprintf(stderr, "oom\n"); return 1; }
+    size_t hits = 0;
+    for (size_t i = 0; i < n; i++) {
+	if (has_nodata && buf[i] == nodata) { mask[i] = 0; continue; }
+	mask[i] = (out[i] > 0.5f) ? 1 : 0;
+	hits += mask[i];
+    }
+
+    /* --- write georeferenced mask --- */
+    GDALDriverH drv = GDALGetDriverByName("GTiff");
+    GDALDatasetH outds = GDALCreate(drv, out_path, nx, ny, 1, GDT_Byte, NULL);
+    if (!outds) { fprintf(stderr, "create failed: %s\n", out_path); return 1; }
+    double gt[6];
+    GDALGetGeoTransform(in, gt);
+    GDALSetGeoTransform(outds, gt);
+    GDALSetProjection(outds, GDALGetProjectionRef(in));
+    GDALRasterBandH oband = GDALGetRasterBand(outds, 1);
+    if (GDALRasterIO(oband, GF_Write, 0, 0, nx, ny, mask, nx, ny, GDT_Byte,  0, 0) != CE_None) {
+	fprintf(stderr, "write failed\n"); return 1;
+    }
+    GDALClose(outds);
+
+    /* --- cleanup --- */
+    g->ReleaseValue(output_tensor);
+    g->ReleaseValue(input_tensor);
+    g->ReleaseMemoryInfo(mem);
+    g->ReleaseSession(session);
+    g->ReleaseSessionOptions(opts);
+    g->ReleaseEnv(env);
+    GDALClose(in);
+    free(buf);
+    free(mask);
+
+    printf("wrote %s: %zu/%zu foreground (model %s)\n", out_path, hits, n, model_path);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -292,12 +388,13 @@ int main(int argc, char **argv)
     return 1;
     }
     const char *sub = argv[1];
-    if (strcmp(sub, "proj")  == 0) return cmd_proj(argc - 2, argv + 2);
-    if (strcmp(sub, "info")  == 0) return cmd_info(argc - 2, argv + 2);
-    if (strcmp(sub, "stats") == 0) return cmd_stats(argc - 2, argv + 2);
-    if (strcmp(sub, "mask")  == 0) return cmd_mask(argc - 2, argv + 2);
-    if (strcmp(sub, "infer") == 0) return cmd_infer(argc - 2, argv + 2);
-
+    if (strcmp(sub, "proj")    == 0) return cmd_proj(argc - 2, argv + 2);
+    if (strcmp(sub, "info")    == 0) return cmd_info(argc - 2, argv + 2);
+    if (strcmp(sub, "stats")   == 0) return cmd_stats(argc - 2, argv + 2);
+    if (strcmp(sub, "mask")    == 0) return cmd_mask(argc - 2, argv + 2);
+    if (strcmp(sub, "infer")   == 0) return cmd_infer(argc - 2, argv + 2);
+    if (strcmp(sub, "segment") == 0) return cmd_segment(argc - 2, argv + 2);
+    
     fprintf(stderr, "unknown subcommand: %s\n", sub);
     return 1;
 }
